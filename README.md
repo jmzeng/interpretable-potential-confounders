@@ -1,5 +1,4 @@
-# interpretable-potential-confounders
-Identifying interpretable potential confounders from clinical text
+# Uncovering interpretable potential confounders from clinical text
 
 This repository presents a simple pipeline that can be used to uncover potential interpretable confounders from clinical text. 
 
