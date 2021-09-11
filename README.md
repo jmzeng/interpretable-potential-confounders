@@ -7,10 +7,10 @@ Due to IRB restrictions, we cannot share the data needed to demonstrate the code
 ## Instructions:
 To run the pipeline, please process your dataset of choice for treatment surivival analysis. The code requires a data input with at least the following fields:
 
-W: indicator of binary treatment
-Y: time-to-event outcome
-D: indication of event of interest
-X: set of covariates
+* W: indicator of binary treatment
+* Y: time-to-event outcome
+* D: indication of event of interest
+* X: set of covariates
 
 For interesting results, please include at least 100 covariates. The set of covariates can be selected from structured data and unstructured data. For details on how to process the unstructured data, please refer to the paper. 
 
