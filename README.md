@@ -10,9 +10,11 @@ To run the pipeline, please process your dataset of choice for treatment suriviv
 * W: indicator of binary treatment
 * Y: time-to-event outcome
 * D: indication of event of interest
-* X: set of covariates
+* X: set of covariates 
 
-For interesting results, please include at least 100 covariates. The set of covariates can be selected from structured data and unstructured data. For details on how to process the unstructured data, please refer to the paper. 
+For selection of interesting potential confounders, it is recommneded to include as many covariates as the size of the dataset allows. The set of covariates can be selected from structured data and unstructured data. For details on how to process the unstructured data, please refer to the paper. 
 
 Please see our full paper on medArxiv:
 Zeng, J., Gensheimer, M. F., Rubin, D. L., Athey, S., & Shachter, R. D. (2021). Uncovering interpretable potential confounders in electronic medical records. medRxiv. https://www.medrxiv.org/content/10.1101/2021.02.03.21251034v3
+
+For questions, please contact Jiaming Zeng at jiaming (at) alum.stanford.edu. 
