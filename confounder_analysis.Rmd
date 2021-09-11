@@ -1,0 +1,421 @@
+---
+title: "Potential Confounders Analysis Pipeline"
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+Due to IRB restrictions, we cannot share the data needed to demonstrate the code. We can share the R analysis pipeline post data-processing as an example of how to implement our method. The existing code is developed on R version 4.0.2. The relevant package dependences are listed in the next section. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, progress = FALSE)
+set.seed(123)
+
+# Relevant packages dependencies
+library("survival")
+library("ggfortify")
+library("glmnet")
+library("grf")
+library("dplyr")
+library("xtable")
+library("stringr")
+library("ggplot2")
+library("MatchIt")
+library("cobalt")
+library("gridExtra")
+
+# Set variables for analysis
+# Directory where data is located
+data_dir = "/share/pi/rubin/jiaming/data_confounder"
+
+# Tags to select for cancer type and treatments to analyze
+cancer_type = "prostate"
+treatA = "surgery"
+treatB = "radiation"
+tag = "final"
+```
+
+### Data Preprocessing
+
+```{r, echo=FALSE}
+# Load training and test data with bow matrices. 
+data_train = read.csv(sprintf("%s/%s_%s_%s_train.csv", data_dir, cancer_type, treatA, treatB))
+data_test = read.csv(sprintf("%s/%s_%s_%s_test.csv", data_dir, cancer_type, treatA, treatB))
+
+# Renumber the treatment column so we have 0/1 encoding
+if (treatA == "monitoring") {
+    data_train$W[data_train$W == 2] = 0
+    data_test$W[data_test$W == 2] = 0
+} else if (treatA == "surgery" & treatB == "monitoring") {
+    data_train$W[data_train$W == 2] = 1
+    data_test$W[data_test$W == 2] = 1
+}
+
+# Combine data for train and test and select some columns
+data = rbind(data_train, data_test)
+
+# Add character label for treatment
+data$W. = data$W
+data$W.[data$W. == 0] = treatA
+data$W.[data$W. == 1] = treatB
+
+# Select covariates and scale X
+covariates = colnames(data)[!colnames(data) %in% c("W", "W.", "Y", "D", "PATIENT_ID")]
+X = as.matrix(scale(data[, covariates]))
+```
+
+## Plot propensity scores before analysis
+
+We plot the propensity score before analysis to check for overlap and ensure the data is suitable for causal analysis.
+
+```{r}
+# Estimate the propensity scores with grf
+forest.w = regression_forest(X, data$W, tune.parameters = "all")
+W.hat <- predict(forest.w)$predictions
+```
+```{r}
+# Plot the propensity scores with y as density 
+prop.orig.plot = PropensityPlot(data$W., W.hat)
+ggsave(sprintf("%s_%s_propensity.png", treatA, treatB), width = 7, height = 5, units = "in")
+```
+
+## Identifying potential confounders
+
+We identify potential confounders from the data by creating a prediction model for the treatment and outcome respectively. Then, we identify the covariates that are not zero-ed out by both prediction models as the intersection terms, i.e. potential confounders.
+
+```{r}
+# Training Lasso model for predicting treatment
+treatment_lambda = cv.glmnet(X, data$W, alpha = 1, 
+                             family = 'binomial', 
+                             nfolds=5)
+```
+```{r}
+# Identify the top predictors of treatment
+coefs = coef(treatment_lambda, s = treatment_lambda$lambda.1se)
+glmnet.wordimp = as.data.frame(cbind(covariates, coefs[-1]))
+names(glmnet.wordimp)[2] <- "coefs"
+glmnet.wordimp$coefs = as.numeric(glmnet.wordimp$coefs)
+
+topw.glmnet = glmnet.wordimp[glmnet.wordimp$coefs != 0,]
+row.names(topw.glmnet) <- NULL
+```
+```{r}
+treat.coef.plot = CoefficientPlot(topw.glmnet, treatA, treatB, "Treatment")
+```
+
+
+```{r}
+# Training a Lasso model for predicting survival
+lm.survival = cv.glmnet(X, Surv(data$Y, data$D), 
+                        family="cox", type.measure = "C", alpha=1)
+```
+```{r}
+# Find max coefficients from survival model
+lm.survival.full = glmnet(X, Surv(data$Y, data$D), 
+                          family="cox", alpha=1, type.measure = "C", lambda = lm.survival$lambda.1se)
+coxnet.wordimp = as.data.frame(cbind(covariates, as.numeric(lm.survival.full$beta)))
+names(coxnet.wordimp)[2] <- "coefs"
+
+coxnet.wordimp$coefs = as.numeric(coxnet.wordimp$coefs)
+topw.coxnet = coxnet.wordimp[coxnet.wordimp$coefs != 0,]
+rownames(topw.coxnet) <- NULL
+```
+```{r}
+outcome.coef.plot = CoefficientPlot(topw.coxnet, treatA, treatB, "Survival Outcome")
+```
+
+We find the intersection terms with the highest likelihood of being potential confounders.
+
+```{r}
+# Save coefficient plots
+ggsave(file=sprintf("%s_%s_%s_coefs_treatment.png", treatA, treatB, tag), treat.coef.plot, width = 8, height = 5, units = "in")
+ggsave(file=sprintf("%s_%s_%s_coefs_outcome.png", treatA, treatB, tag), outcome.coef.plot, width = 8, height = 5, units = "in")
+```
+
+## Perform analysis with the combinations of intersection covariates
+
+We utilize the following covariate combinations for comparison:
+  - Structured
+  - Intersection
+  - Intersect+structured
+  
+We perform the following with different covariate combinations:
+  - Multivariate coxph modeling
+  - Matching on Propensity Scores
+  - Inverse Propensity of Treatment Weighting
+
+For each of the settings above, we plot the 
+  - Propensity score with selected covariates
+  - Covarite balance plot after weighting
+  - The hazard ratio comparison plot
+  
+```{r}
+# Covariate combinations
+structured = c('race_white', 'race_api', 'race_black', 'hispanic','pat_age',
+               'stage','tumor_grade',
+               'grade_unknown',
+               'diagnosis_year')
+w.intersect = intersect(topw.coxnet$covariates, topw.glmnet$covariates)
+intersect.structured = union(w.intersect, structured)
+```
+
+```{r}
+structured.results = SurvivalAnalysisPipe(structured, data, treatA, treatB, "structured")
+intersect.results = SurvivalAnalysisPipe(w.intersect, data, treatA, treatB, "intersect")
+intersect.structured.results = SurvivalAnalysisPipe(intersect.structured, data, treatA, treatB, "intersect.structured")
+```
+
+# Summarize results and plot data
+
+```{r}
+# Create results summary table
+results.summary = bind_rows(intersect.structured.results$results, 
+                            intersect.stage.results$results, 
+                            intersect.results$results, 
+                            structured.results$results)
+results.summary = results.summary %>%
+                      mutate(ID=row_number(),
+                            pval=ifelse(treat.p >= .001, sprintf("%.3f", treat.p), "<0.001"),
+                            hr.str= sprintf("%s: %.2f (%.2f-%.2f), %s", data_type, HR, HR.ci.lower, HR.ci.upper, pval))
+```
+```{r}
+forestplot = forest.plot(results.summary)
+textplot = text.col.plot(results.summary)
+g = arrangeGrob(textplot, forestplot, ncol = 2)
+ggsave(file=sprintf("%s_%s_%s_summary.png", treatA, treatB, tag), g, width = 10, height = 5, units = "in")
+```
+
+Helper Functions for all survival analysis
+```{r}
+SurvivalAnalysisPipe = function(selected.covariates, data, treatA, treatB, data_type, save_plot=TRUE) {
+  df.results = data.frame(
+    group = character(),
+    data_type = character(),
+    model = character(),
+    HR = double(),
+    HR.ci.lower = double(),
+    HR.ci.upper = double(),
+    treat.p = double(),
+    robust.scr = double(),
+    concordance = double(),
+    model.p = double(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Propensity score of selected covariates
+  X.filtered = as.matrix(scale(data[selected.covariates]))
+  
+  # Plot propensity scores with grf
+  forest.w = regression_forest(X.filtered, data$W, tune.parameters = "all")
+  propscrs.adjusted <- predict(forest.w)$predictions
+  propplot.adjusted = PropensityPlot(data$W., propscrs.adjusted)
+  
+  # Multivariate coxph model
+  sumx = paste(selected.covariates, collapse = " + ")
+  surv.formula <- paste("Surv(Y, D) ~ W.", sumx, sep = " + ")
+  surv.formula <- as.formula(surv.formula)
+  
+  coxph = coxph(surv.formula, data = data, robust = TRUE)
+  coxph.stats = summary(coxph)
+  df.results = rbind(
+    df.results,
+    gather_coxph_stats(coxph.stats, treatA, treatB, data_type, "multivariate.coxph")
+  )
+  
+  ##### Matching
+  # Matching based on selected covariates
+  treat.formula <- paste("W", sumx, sep = " ~ ")
+  treat.formula <- as.formula(treat.formula)
+  m.out <- matchit(treat.formula, data = data, method = "nearest")
+  
+  matching.balance.plot = love.plot(bal.tab(m.out, s.d.denom = "pooled", disp.means = TRUE, disp.sds = TRUE),
+                                    drop.distance = TRUE,
+                                    threshold = .2)
+  
+  # Univariate model in matched sample
+  coxph = coxph(as.formula("Surv(Y, D) ~ W."),
+                data = match.data(m.out),
+                robust = TRUE)
+  match.stats = summary(coxph)
+  df.results = rbind(
+    df.results,
+    gather_coxph_stats(match.stats, treatA, treatB, data_type, "matching")
+  )
+  
+  ##### IPTW
+  # Inverse Propensity of Treatment Weighting with stabilization
+  stab = 0.95
+  weights = propscrs.adjusted
+  weights = data$W + (1 - data$W) * weights / (1 - weights)
+  weights[weights > stab * max(weights)] = stab * max(weights)
+  weights[weights < stab * min(weights)] = stab * min(weights)
+  data$prop_weights = weights
+  
+  iptw.balance.plot = love.plot(
+    x = treat.formula,
+    data = data,
+    weights = data$prop_weight,
+    method = "weighting",
+    drop.distance = TRUE,
+    threshold = .2,
+    s.d.denom = "pooled"
+  )
+    
+  # Univariate model in IPTW models
+  coxph = coxph(
+    as.formula("Surv(Y, D) ~ W."),
+    data = data,
+    robust = TRUE,
+    weights = data$prop_weights
+  )
+  iptw.stats = summary(coxph)
+  df.results = rbind(df.results,
+                     gather_coxph_stats(iptw.stats, treatA, treatB, data_type, "IPTW"))
+  
+  if (save_plot) {
+    g = arrangeGrob(propplot.adjusted, matching.balance.plot, iptw.balance.plot, ncol = 3)
+    ggsave(file=sprintf("%s_%s_%s_%s.png", treatA, treatB, tag, gsub("\\.", "_", data_type)), g, width = 20, height = 5, units = "in")
+  }
+  
+  return (list(results = df.results,
+    adj.prop.plot = propplot.adjusted,
+    matching.bal.plot = matching.balance.plot,
+    iptw.bal.plot = iptw.balance.plot
+  ))
+}
+  
+```
+
+Define helper functions for displaying results
+```{r helper functions}
+PropensityPlot <- function(Treatment, propensity_scores){
+  df = data.frame(Treatment = data$W., propensity_scores = propscrs.adjusted)
+  ggplot(df, aes(x = propensity_scores, group=Treatment, color=Treatment)) + 
+  geom_histogram(fill="white", aes(y=..density..), position="identity", alpha=0.25, bins = 50) + 
+  labs(title = "Propensity Scores (P[Treatment|Covariates-Outcomes])",
+       x = "Probability of Treatment",
+       y = "Density")
+}
+
+# Plot the top predictors of treatment and outcome
+CoefficientPlot <- function(df, treatA, treatB, outcome) {
+  # Set parameters based on model
+  if (outcome == "Treatment") {
+    yticks = c(min(df$coefs)/2, max(df$coefs)/2)
+    ylabels = c(treatA,treatB)
+    expandy = c(min(df$coefs)/2, max(df$coefs)/2)
+    nudgey = 0.05
+  } else {
+    yticks = c(min(-0.1, min(df$coefs)/2), max(df$coefs)/2)
+    ylabels = c("good prognostic","bad prognostic")
+    #expandx = c(0, nrow(df))
+    expandy = c(min(-0.1, min(df$coefs)/2), max(df$coefs)/2)
+    nudgey = 0.03
+  }
+  
+  # Generate plot
+  ggplot(df, aes(x=covariates, y=coefs)) +
+  geom_point(aes(colour = factor(df$coefs > 0))) + 
+  geom_text(label=df$covariates, nudge_y = nudgey) + 
+  geom_hline(yintercept=0, linetype="dashed", color="red") + 
+  scale_y_continuous(breaks=yticks,
+                   labels=ylabels) + 
+  expand_limits(x=c(-3, nrow(df)+3), y=expandy) + 
+  theme(#axis.title.x=element_blank(),
+        #axis.title.y=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        legend.position="none") + 
+  labs(title = sprintf("Coefficients of %s Model: %s-%s", outcome, treatA, treatB),
+       y = "Regression Coefficient Indication",
+       x = "Covariates")
+}
+
+forest.plot <- function(df, title=" ", trt.cols=NULL, xlabel="Hazard Ratio",
+                        titles=1, axis=1, shape.leg=TRUE) {
+  hr.lims = c(min(results.summary$HR.ci.lower), max(results.summary$HR.ci.upper))
+  forest.plt <- df %>%
+    ggplot(aes(x=ID, y=HR, color=data_type, shape=model)) +
+    geom_hline(aes(yintercept=1), size=.5, linetype=2) +
+    geom_point(size=2) +
+    geom_linerange(aes(ymin=HR.ci.lower, ymax=HR.ci.upper)) +
+    scale_y_continuous(limits=hr.lims, labels=do.call(c, lapply(seq(round(hr.lims[1]*5)/5, hr.lims[2], .2),
+                                                                function(i) {
+                                                                  ifelse(round(i %% .4, digits=1) %% .4 == 0, i, "")
+                                                                })),
+                       breaks=seq(round(hr.lims[1]*5)/5, hr.lims[2], .2))
+  if (!is.null(trt.cols)) {
+    forest.plt <- forest.plt + scale_color_manual(values=trt.cols)
+  }
+  
+  forest.plt <- forest.plt +
+    xlab(" ") +
+    ylab(ifelse(is.null(xlabel), " ", xlabel)) +
+    coord_flip() +
+    theme_classic() +
+    guides(color=FALSE, shape=guide_legend(reverse=TRUE)) +
+    theme(legend.position=c(0.3, 1.05),
+          legend.direction = "horizontal",
+          legend.key.size = unit(0.2, "cm"),
+          axis.text.y=element_blank(), 
+          axis.ticks.y=element_blank(),
+          axis.title.y=element_blank(), 
+          panel.grid.major=element_blank(),
+          axis.line.y = element_blank(),
+          panel.grid.minor=element_blank(),
+          plot.margin=grid::unit(c(2,0,0,0), "mm"),
+          legend.box.background=element_rect(color="white", fill = "white"),
+          rect=element_rect(fill="transparent")) +
+    ggtitle(title)
+  if (!shape.leg) {
+    forest.plt <- forest.plt + guides(shape=FALSE)
+  }
+  return(forest.plt)
+}
+
+text.col.plot <- function(df, title=" ", expand=TRUE) {
+  plt <- ggplot(data=df, aes(y=ID, x=1, label=as.character(hr.str))) +
+    geom_text(hjust=1, vjust = 1) +
+    ylab(NULL) + xlab(" ") +
+    ggtitle(title) +
+    scale_x_continuous(limits=c(.95, 1)) +
+    coord_cartesian(clip="off") +
+    theme(plot.title = element_text(hjust = 0.3, size=5), ## centering title on text
+          axis.text.x=element_text(color=alpha('white', 0.0)), ## need text to be printed so it stays aligned with figure but white so it's invisible
+          axis.line=element_blank(),
+          axis.text.y=element_blank(),
+          axis.ticks=element_blank(),
+          axis.title.y=element_blank(),legend.position="none",
+          panel.background=element_blank(),
+          panel.border=element_blank(),
+          plot.margin=grid::unit(c(0,0,0,0), "mm"),
+          panel.grid.major=element_blank(),
+          panel.grid.minor=element_blank(),
+          plot.background=element_blank(),
+          rect=element_rect(fill="transparent"))
+  if (expand) {
+    plt <- plt +
+      scale_y_continuous(expand=c(.065,.065))
+  }
+  return(plt)
+}
+
+gather_coxph_stats = function(coxph.stats, treatA, treatB, data_type, model_name, sig.digits = 3) {
+  results = list(group = sprintf("%s-%s", treatA, treatB),
+    data_type = data_type,
+    model = model_name,
+    HR = signif(coxph.stats$conf.int['W.surgery',"exp(coef)"], sig.digits),
+    HR.ci.lower = signif(coxph.stats$conf.int['W.surgery',"lower .95"], sig.digits),
+    HR.ci.upper = signif(coxph.stats$conf.int['W.surgery',"upper .95"], sig.digits),
+    treat.p =  signif(coxph.stats$coefficients['W.surgery','Pr(>|z|)'], sig.digits),
+    robust_scr = signif(coxph.stats$robscore[['test']], sig.digits),
+    concordance = signif(coxph.stats$concordance[['C']], sig.digits),
+    model.p = signif(coxph.stats$robscore[['pvalue']], sig.digits)
+  )
+  
+  return (results)
+}
+```
