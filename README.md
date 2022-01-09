@@ -18,3 +18,4 @@ Please see our full paper on medArxiv:
 Zeng, J., Gensheimer, M. F., Rubin, D. L., Athey, S., & Shachter, R. D. (2021). Uncovering interpretable potential confounders in electronic medical records. medRxiv. https://www.medrxiv.org/content/10.1101/2021.02.03.21251034v3
 
 For questions, please contact Jiaming Zeng at jiaming (at) alum.stanford.edu. 
+We thank Allison Koenecke (https://infosci.cornell.edu/~koenecke/) for lending us a basis for the R Code.
